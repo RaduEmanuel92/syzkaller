@@ -77,6 +77,7 @@ var (
 	triage          []Input
 	triageCandidate []Input
 	candidates      []Candidate
+	smashQueue      []Input
 
 	gate *ipc.Gate
 
@@ -85,10 +86,13 @@ var (
 	statExecCandidate uint64
 	statExecTriage    uint64
 	statExecMinimize  uint64
+	statExecSmash     uint64
 	statNewInput      uint64
 
-	allTriaged uint32
-	noCover    bool
+	allTriaged            uint32
+	noCover               bool
+	smashing              uint32
+	faultInjectionEnabled bool
 )
 
 func main() {
@@ -155,12 +159,24 @@ func main() {
 		}
 	}
 
+	/*
+	if fd, err := syscall.Open("/sys/kernel/debug/fail_once", syscall.O_RDWR, 0); err == nil {
+		syscall.Close(fd)
+		faultInjectionEnabled = true
+	}
+	*/
+
 	if r.NeedCheck {
 		a := &CheckArgs{Name: *flagName}
 		if fd, err := syscall.Open("/sys/kernel/debug/kcov", syscall.O_RDWR, 0); err == nil {
 			syscall.Close(fd)
 			a.Kcov = true
 		}
+		if fd, err := syscall.Open("/sys/kernel/debug/kmemleak", syscall.O_RDWR, 0); err == nil {
+			syscall.Close(fd)
+			a.Leak = true
+		}
+		a.Fault = faultInjectionEnabled
 		for c := range calls {
 			a.Calls = append(a.Calls, c.Name)
 		}
@@ -187,6 +203,9 @@ func main() {
 	}
 	if _, ok := calls[sys.CallMap["syz_emit_ethernet"]]; ok {
 		flags |= ipc.FlagEnableTun
+	}
+	if faultInjectionEnabled {
+		flags |= ipc.FlagEnableFaultInjection
 	}
 	noCover = flags&ipc.FlagSignal == 0
 	leakCallback := func() {
@@ -216,7 +235,7 @@ func main() {
 
 			for i := 0; ; i++ {
 				triageMu.RLock()
-				if len(triageCandidate) != 0 || len(candidates) != 0 || len(triage) != 0 {
+				if len(triageCandidate) != 0 || len(candidates) != 0 || len(triage) != 0 || (/*atomic.LoadUint32(&smashing) == 0 &&*/ len(smashQueue) != 0) {
 					triageMu.RUnlock()
 					triageMu.Lock()
 					if len(triageCandidate) != 0 {
@@ -250,6 +269,15 @@ func main() {
 						Logf(1, "triaging : %s", inp.p)
 						triageInput(pid, env, inp)
 						continue
+					} else if len(smashQueue) != 0 /*&& atomic.SwapUint32(&smashing, 1) == 0*/ {
+						last := len(smashQueue) - 1
+						inp := smashQueue[last]
+						smashQueue = smashQueue[:last]
+						triageMu.Unlock()
+						Logf(1, "%v: smashing call %v in program: %v", pid, inp.call, inp.p.String())
+						smashInput(pid, env, inp)
+						atomic.StoreUint32(&smashing, 0)
+						continue
 					} else {
 						triageMu.Unlock()
 					}
@@ -257,20 +285,29 @@ func main() {
 					triageMu.RUnlock()
 				}
 
+				var p *prog.Prog
+				var stat *uint64
 				corpusMu.RLock()
 				if len(corpus) == 0 || i%100 == 0 {
 					// Generate a new prog.
 					corpusMu.RUnlock()
-					p := prog.Generate(rnd, programLength, ct)
+					p = prog.Generate(rnd, programLength, ct)
+					stat = &statExecGen
 					Logf(1, "#%v: generated: %s", i, p)
-					execute(pid, env, p, false, false, false, &statExecGen)
 				} else {
 					// Mutate an existing prog.
-					p := corpus[rnd.Intn(len(corpus))].Clone()
+					p = corpus[rnd.Intn(len(corpus))].Clone()
 					corpusMu.RUnlock()
 					p.Mutate(rs, programLength, ct, corpus)
+					stat = &statExecFuzz
 					Logf(1, "#%v: mutated: %s", i, p)
-					execute(pid, env, p, false, false, false, &statExecFuzz)
+				}
+
+				execute(pid, env, p, false, false, false, stat)
+
+				if faultInjectionEnabled && (i%100) == 0 /*&& atomic.SwapUint32(&smashing, 1) == 0*/ {
+					failAll(pid, env, p)
+					atomic.StoreUint32(&smashing, 0)
 				}
 			}
 		}()
@@ -330,6 +367,9 @@ func main() {
 			execMinimize := atomic.SwapUint64(&statExecMinimize, 0)
 			a.Stats["exec minimize"] = execMinimize
 			execTotal += execMinimize
+			execSmash := atomic.SwapUint64(&statExecSmash, 0)
+			a.Stats["exec smash"] = execSmash
+			execTotal += execSmash
 			a.Stats["fuzzer new inputs"] = atomic.SwapUint64(&statNewInput, 0)
 			r := &PollRes{}
 			if err := manager.Call("Manager.Poll", a, r); err != nil {
@@ -437,6 +477,40 @@ func addInput(inp RpcInput) {
 	}
 }
 
+func smashInput(pid int, env *ipc.Env, inp Input) {
+	failCall(pid, env, inp.p, inp.call)
+}
+
+func failAll(pid int, env *ipc.Env, p *prog.Prog) {
+	for call := range p.Calls {
+		failCall(pid, env, p, call)
+	}
+}
+
+func failCall(pid int, env *ipc.Env, p *prog.Prog, call int) {
+/*
+	if atomic.LoadUint32(&smashing) == 0 {
+		panic("parallel fault injection")
+	}
+*/
+	faultType := 0
+	//for faultType := 0; faultType < ipc.FaultCount; faultType++ {
+		for nth := 0; nth < 100; nth++ {
+			Logf(2, "%v: injecting fault %v into call %v/%v in program: %v", pid, faultType, call, nth, p.String())
+			opts := &ipc.ExecOpts{
+				Flags:     ipc.FlagInjectFault,
+				FaultType: faultType,
+				FaultCall: call,
+				FaultNth:  nth,
+			}
+			info := execute1(pid, env, opts, p, &statExecSmash)
+			if info != nil && len(info) > call && !info[call].FaultInjected {
+				break
+			}
+		}
+	//}
+}
+
 func triageInput(pid int, env *ipc.Env, inp Input) {
 	if noCover {
 		panic("should not be called when coverage is disabled")
@@ -456,10 +530,13 @@ func triageInput(pid int, env *ipc.Env, inp Input) {
 
 	Logf(3, "triaging input for %v (new signal=%v):\n%s", call.CallName, len(newSignal), data)
 	var inputCover cover.Cover
+	opts := &ipc.ExecOpts{
+		Flags: ipc.FlagCollectCover,
+	}
 	if inp.minimized {
 		// We just need to get input coverage.
 		for i := 0; i < 3; i++ {
-			info := execute1(pid, env, inp.p, &statExecTriage, true)
+			info := execute1(pid, env, opts, inp.p, &statExecTriage)
 			if len(info) == 0 || len(info[inp.call].Cover) == 0 {
 				continue // The call was not executed. Happens sometimes.
 			}
@@ -470,7 +547,7 @@ func triageInput(pid int, env *ipc.Env, inp Input) {
 		// We need to compute input coverage and non-flaky signal for minimization.
 		notexecuted := false
 		for i := 0; i < 3; i++ {
-			info := execute1(pid, env, inp.p, &statExecTriage, true)
+			info := execute1(pid, env, opts, inp.p, &statExecTriage)
 			if len(info) == 0 || len(info[inp.call].Signal) == 0 {
 				// The call was not executed. Happens sometimes.
 				if notexecuted {
@@ -533,10 +610,20 @@ func triageInput(pid int, env *ipc.Env, inp Input) {
 		corpusHashes[sig] = struct{}{}
 	}
 	corpusMu.Unlock()
+
+	if !inp.minimized {
+		triageMu.Lock()
+		smashQueue = append(smashQueue, inp)
+		triageMu.Unlock()
+	}
 }
 
 func execute(pid int, env *ipc.Env, p *prog.Prog, needCover, minimized, candidate bool, stat *uint64) []ipc.CallInfo {
-	info := execute1(pid, env, p, stat, needCover)
+	opts := &ipc.ExecOpts{}
+	if needCover {
+		opts.Flags |= ipc.FlagCollectCover
+	}
+	info := execute1(pid, env, opts, p, stat)
 	signalMu.RLock()
 	defer signalMu.RUnlock()
 
@@ -572,7 +659,7 @@ func execute(pid int, env *ipc.Env, p *prog.Prog, needCover, minimized, candidat
 
 var logMu sync.Mutex
 
-func execute1(pid int, env *ipc.Env, p *prog.Prog, stat *uint64, needCover bool) []ipc.CallInfo {
+func execute1(pid int, env *ipc.Env, opts *ipc.ExecOpts, p *prog.Prog, stat *uint64) []ipc.CallInfo {
 	if false {
 		// For debugging, this function must not be executed with locks held.
 		corpusMu.Lock()
@@ -583,9 +670,16 @@ func execute1(pid int, env *ipc.Env, p *prog.Prog, stat *uint64, needCover bool)
 		triageMu.Unlock()
 	}
 
+	opts.Flags |= ipc.FlagDedupCover
+
 	// Limit concurrency window and do leak checking once in a while.
 	idx := gate.Enter()
 	defer gate.Leave(idx)
+
+	strOpts := ""
+	if opts.Flags&ipc.FlagInjectFault != 0 {
+		strOpts = fmt.Sprintf(" (fault:%v call:%v nth:%v)", opts.FaultType, opts.FaultCall, opts.FaultNth)
+	}
 
 	// The following output helps to understand what program crashed kernel.
 	// It must not be intermixed.
@@ -595,19 +689,22 @@ func execute1(pid int, env *ipc.Env, p *prog.Prog, stat *uint64, needCover bool)
 	case "stdout":
 		data := p.Serialize()
 		logMu.Lock()
-		Logf(0, "executing program %v:\n%s", pid, data)
+		Logf(0, "executing program %v%v:\n%s", pid, strOpts, data)
 		logMu.Unlock()
 	case "dmesg":
 		fd, err := syscall.Open("/dev/kmsg", syscall.O_WRONLY, 0)
 		if err == nil {
 			buf := new(bytes.Buffer)
-			fmt.Fprintf(buf, "syzkaller: executing program %v:\n%s", pid, p.Serialize())
+			fmt.Fprintf(buf, "syzkaller: executing program %v%v:\n%s", pid, strOpts, p.Serialize())
 			syscall.Write(fd, buf.Bytes())
 			syscall.Close(fd)
 		}
 	case "file":
 		f, err := os.Create(fmt.Sprintf("%v-%v.prog", *flagName, pid))
 		if err == nil {
+			if strOpts != "" {
+				fmt.Fprintf(f, "#%v\n", strOpts)
+			}
 			f.Write(p.Serialize())
 			f.Close()
 		}
@@ -616,7 +713,7 @@ func execute1(pid int, env *ipc.Env, p *prog.Prog, stat *uint64, needCover bool)
 	try := 0
 retry:
 	atomic.AddUint64(stat, 1)
-	output, info, failed, hanged, err := env.Exec(p, needCover, true)
+	output, info, failed, hanged, err := env.Exec(opts, p)
 	if failed {
 		// BUG in output should be recognized by manager.
 		Logf(0, "BUG: executor-detected bug:\n%s", output)

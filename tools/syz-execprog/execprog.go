@@ -30,6 +30,9 @@ var (
 	flagRepeat    = flag.Int("repeat", 1, "repeat execution that many times (0 for infinite loop)")
 	flagProcs     = flag.Int("procs", 1, "number of parallel processes to execute programs")
 	flagOutput    = flag.String("output", "none", "write programs to none/stdout")
+	flagFaultType = flag.String("fault", "", "fault injection type (slab/page/futex)")
+	flagFaultCall = flag.Int("fault_call", 0, "inject fault into this call (0-based)")
+	flagFaultNth  = flag.Int("fault_nth", 0, "inject fault on n-th operation (0-based)")
 )
 
 func main() {
@@ -56,16 +59,36 @@ func main() {
 		return
 	}
 
+	execOpts := &ipc.ExecOpts{}
 	flags, timeout, err := ipc.DefaultFlags()
 	if err != nil {
 		Fatalf("%v", err)
 	}
-	needCover := flags&ipc.FlagSignal != 0
-	dedupCover := true
+	if flags&ipc.FlagSignal != 0 {
+		execOpts.Flags |= ipc.FlagCollectCover
+	}
+	execOpts.Flags |= ipc.FlagDedupCover
 	if *flagCoverFile != "" {
 		flags |= ipc.FlagSignal
-		needCover = true
-		dedupCover = false
+		execOpts.Flags |= ipc.FlagCollectCover
+		execOpts.Flags &^= ipc.FlagDedupCover
+	}
+
+	if *flagFaultType != "" {
+		switch *flagFaultType {
+		case "slab":
+			execOpts.FaultType = ipc.FaultSlab
+		case "page":
+			execOpts.FaultType = ipc.FaultPageAlloc
+		case "futex":
+			execOpts.FaultType = ipc.FaultFutex
+		default:
+			Fatalf("unknown fault type: %v", *flagFaultType)
+		}
+		flags |= ipc.FlagEnableFaultInjection
+		execOpts.Flags |= ipc.FlagInjectFault
+		execOpts.FaultCall = *flagFaultCall
+		execOpts.FaultNth = *flagFaultNth
 	}
 
 	handled := make(map[string]bool)
@@ -119,7 +142,8 @@ func main() {
 						Logf(0, "executing program %v:\n%s", pid, data)
 						logMu.Unlock()
 					}
-					output, info, failed, hanged, err := env.Exec(p, needCover, dedupCover)
+
+					output, info, failed, hanged, err := env.Exec(execOpts, p)
 					if atomic.LoadUint32(&shutdown) != 0 {
 						return false
 					}

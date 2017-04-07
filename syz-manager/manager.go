@@ -730,7 +730,8 @@ func (mgr *Manager) Check(a *CheckArgs, r *int) error {
 	if mgr.vmChecked {
 		return nil
 	}
-	Logf(1, "fuzzer %v vm check: %v calls enabled", a.Name, len(a.Calls))
+	Logf(1, "fuzzer %v vm check: %v calls enabled, kcov=%v, kleakcheck=%v, faultinjection=%v",
+		a.Name, len(a.Calls), a.Kcov, a.Leak, a.Fault)
 	if len(a.Calls) == 0 {
 		Fatalf("no system calls enabled")
 	}
@@ -895,6 +896,8 @@ func (mgr *Manager) hubSync() {
 		delete(mgr.hubCorpus, sig)
 		a.Del = append(a.Del, sig.String())
 	}
+
+again:
 	mgr.mu.Unlock()
 	r := new(HubSyncRes)
 	if err := mgr.hub.Call("Hub.Sync", a, r); err != nil {
@@ -922,4 +925,9 @@ func (mgr *Manager) hubSync() {
 	mgr.stats["hub drop"] += uint64(dropped)
 	mgr.stats["hub new"] += uint64(len(r.Inputs) - dropped)
 	Logf(0, "hub sync: add %v, del %v, drop %v, new %v", len(a.Add), len(a.Del), dropped, len(r.Inputs)-dropped)
+	if  len(r.Inputs) != 0 && r.More {
+		a.Add = nil
+		a.Del = nil
+		goto again
+	}
 }

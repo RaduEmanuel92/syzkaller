@@ -589,6 +589,12 @@ static int namespace_sandbox_proc(void* arg)
 		fail("mkdir failed");
 	if (mount("/dev", "./syz-tmp/newroot/dev", NULL, MS_BIND | MS_REC | MS_PRIVATE, NULL))
 		fail("mount(dev) failed");
+	if (mkdir("./syz-tmp/newroot/proc", 0700))
+		fail("mkdir failed");
+	//if (mount("/proc", "./syz-tmp/newroot/proc", NULL, MS_BIND | MS_REC | MS_PRIVATE, NULL))
+	//	fail("mount(proc) failed");
+	if (mount(NULL, "./syz-tmp/newroot/proc", "proc", 0, NULL))
+		fail("mount(proc) failed");
 	if (mkdir("./syz-tmp/pivot", 0777))
 		fail("mkdir failed");
 	if (syscall(SYS_pivot_root, "./syz-tmp", "./syz-tmp/pivot")) {
